@@ -177,5 +177,5 @@ def overlay(image_id):
 
 
 if __name__ == '__main__':
-    print('Open http://127.0.0.1:8501 in your browser. Stop with Ctrl+C.')
-    app.run(host='127.0.0.1', port=8501, debug=False, threaded=True)
+    print('Open http://127.0.0.1:8503')
+    app.run(host='127.0.0.1', port=8503, debug=False, threaded=True)
