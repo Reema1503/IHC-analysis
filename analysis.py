@@ -5,7 +5,7 @@ import re
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 from scipy import ndimage as ndi
-from skimage.color import rgb2hed, hed2rgb
+from skimage.color import rgb2hed, hed2rgb, separate_stains, combine_stains, rgb_from_hed
 import tifffile
 
 # TIFF containers can advertise a giant page 0 even when only a small page is read.
@@ -135,15 +135,30 @@ def read_image(path, name=None):
     return rgb, meta
 
 
-def stain_channels(rgb):
+# H&E basis: fixed normalized H/E vectors, plus an orthogonal residual direction.
+# The residual is neither DAB nor a third biological stain.
+RGB_FROM_HE = np.array(rgb_from_hed, dtype=float, copy=True)
+RGB_FROM_HE[:2] /= np.linalg.norm(RGB_FROM_HE[:2], axis=1, keepdims=True)
+RGB_FROM_HE[2] = np.cross(RGB_FROM_HE[0], RGB_FROM_HE[1])
+RGB_FROM_HE[2] /= np.linalg.norm(RGB_FROM_HE[2])
+HE_FROM_RGB = np.linalg.inv(RGB_FROM_HE)
+
+
+def stain_channels(rgb, mode='dab'):
+    if mode == 'he':
+        return separate_stains(rgb, HE_FROM_RGB).astype(np.float32)
+    if mode != 'dab':
+        raise ValueError('Unknown stain mode.')
+
     """Fixed scikit-image HED basis; H=0, DAB=2. Values are relative, not calibrated."""
     return np.maximum(rgb2hed(rgb), 0).astype(np.float32)
 
 
-def stain_preview(hed, index):
+def stain_preview(hed, index, mode='dab'):
     separated = np.zeros_like(hed)
     separated[..., index] = hed[..., index]
-    return np.round(np.clip(hed2rgb(separated), 0, 1) * 255).astype(np.uint8)
+    reconstructed = combine_stains(separated, RGB_FROM_HE) if mode == 'he' else hed2rgb(separated)
+    return np.round(np.clip(reconstructed, 0, 1) * 255).astype(np.uint8)
 
 
 def rectangle_mask(shape, rect):
@@ -177,22 +192,31 @@ def tissue_mask(rgb, settings):
     return mask
 
 
-def measure(rgb, hed, settings):
+def measure(rgb, stains, settings):
+    mode = settings.get('stain_mode', 'dab')
+    channel = settings.get('measure_channel', 'hematoxylin' if mode == 'he' else 'dab')
+    allowed = {'he': {'hematoxylin': 0, 'eosin': 1}, 'dab': {'hematoxylin': 0, 'dab': 2}}
+    if mode not in allowed or channel not in allowed[mode]:
+        raise ValueError('The selected channel does not belong to the confirmed staining mode.')
+    values = stains[..., allowed[mode][channel]]
     threshold = float(settings.get('threshold', .05))
     if not np.isfinite(threshold) or not 0 <= threshold <= 2:
-        raise ValueError('DAB threshold must be 0 to 2.')
+        raise ValueError('Stain threshold must be 0 to 2.')
     mask = tissue_mask(rgb, settings)
     roi = rectangle_mask(mask.shape, settings.get('roi'))
     denominator = mask & roi
-    positive = denominator & (hed[..., 2] > threshold)
-    total, above = int(denominator.sum()), int(positive.sum())
-    hist, edges = np.histogram(hed[..., 2][denominator], bins=40, range=(0, 2))
+    above_mask = denominator & (values > threshold)
+    total, above = int(denominator.sum()), int(above_mask.sum())
+    hist, edges = np.histogram(values[denominator], bins=40, range=(0, 2))
+    mean = float(values[denominator].mean()) if total else None
     return {'tissue_pixels': total, 'area_above_threshold_pixels': above,
             'area_above_threshold_pct': 100 * above / total if total else None,
             'threshold': threshold, 'histogram_counts': hist.tolist(),
-            'histogram_edges': edges.tolist(), 'dab_mean_relative': float(hed[..., 2][denominator].mean()) if total else None,
+            'histogram_edges': edges.tolist(), 'mean_relative_stain': mean,
+            'dab_mean_relative': mean if channel == 'dab' else None,
+            'channel': channel, 'stain_mode': mode,
             'resolution': 'working preview pixels; not cell counts or protein abundance',
-            'method': 'fixed scikit-image HED; DAB channel 2; strictly greater than threshold'}, mask, positive
+            'method': ('fixed normalized H&E + orthogonal residual basis' if mode == 'he' else 'fixed scikit-image HED') + '; ' + channel + '; strictly greater than threshold'}, mask, above_mask
 
 
 def quality(rgb, settings):

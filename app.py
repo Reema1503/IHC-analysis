@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get('IHC_DATA_DIR', ROOT / 'data'))
 DATA.mkdir(parents=True, exist_ok=True)
 app = Flask(__name__)
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 app.config['MAX_CONTENT_LENGTH'] = 1024 * 1024 * 1024  # 1 GiB/request
 lock = RLock()
 
@@ -30,21 +31,26 @@ def image_data(image_id):
     if not (folder / 'meta.json').exists():
         raise ValueError('Upload this original image first.')
     meta = json.loads((folder / 'meta.json').read_text(encoding='utf-8'))
-    rgb = np.array(Image.open(folder / 'original.png').convert('RGB'))
+    with Image.open(folder / 'original.png') as pil:
+        rgb = np.array(pil.convert('RGB'))
     return folder, meta, rgb
 
 
-def ensure_stains(folder, meta, rgb):
+def ensure_stains(folder, meta, rgb, mode='dab'):
     if not meta['is_rgb']:
         raise ValueError('Stain separation requires an RGB brightfield image.')
-    if not (folder / 'hed.npy').exists():
+    if mode not in {'he', 'dab'}:
+        raise ValueError('Select H&E or DAB + hematoxylin and confirm the protocol.')
+    cache = folder / f'{mode}_v11.npy'
+    if not cache.exists():
         with lock:
-            if not (folder / 'hed.npy').exists():
-                hed = stain_channels(rgb)
-                for name, index in [('dab', 2), ('hematoxylin', 0)]:
-                    Image.fromarray(stain_preview(hed, index)).save(folder / f'{name}.png')
-                np.save(folder / 'hed.npy', hed)
-    return np.load(folder / 'hed.npy', mmap_mode='r')
+            if not cache.exists():
+                stains = stain_channels(rgb, mode)
+                channels = [('hematoxylin', 0), ('eosin', 1)] if mode == 'he' else [('hematoxylin', 0), ('dab', 2)]
+                for name, index in channels:
+                    Image.fromarray(stain_preview(stains, index, mode)).save(folder / f'{mode}_v11_{name}.png')
+                np.save(cache, stains)
+    return np.load(cache, mmap_mode='r')
 
 
 def png_response(array):
@@ -54,9 +60,16 @@ def png_response(array):
     return send_file(stream, mimetype='image/png')
 
 
-def confirmed(settings):
-    return (settings.get('confirmed') is True and settings.get('chromogen') == 'DAB (brown)'
-            and settings.get('counterstain') == 'Hematoxylin (blue)')
+def confirmed_mode(settings):
+    if settings.get('confirmed') is not True:
+        raise ValueError('Select your staining mode and tick protocol confirmation first.')
+    staining = settings.get('staining')
+    # Compatibility with v1 DAB settings; H&E must be explicitly selected in v1.1.
+    if staining == 'H&E':
+        return 'he'
+    if staining in {None, 'DAB + hematoxylin'} and settings.get('chromogen') == 'DAB (brown)' and settings.get('counterstain') == 'Hematoxylin (blue)':
+        return 'dab'
+    raise ValueError('Only confirmed H&E or DAB + hematoxylin supports separation.')
 
 
 @app.errorhandler(Exception)
@@ -106,13 +119,17 @@ def upload():
 @app.get('/api/image/<image_id>/<kind>')
 def image_preview(image_id, kind):
     folder, meta, rgb = image_data(image_id)
-    if kind not in {'original', 'dab', 'hematoxylin'}:
+    if kind == 'original':
+        return send_file(folder / 'original.png', mimetype='image/png')
+    if kind not in {'dab', 'hematoxylin', 'eosin'}:
         raise ValueError('Unknown preview type.')
-    if kind != 'original':
-        if request.args.get('confirmed') != 'yes':
-            raise ValueError('Confirm brown DAB and blue hematoxylin before stain separation.')
-        ensure_stains(folder, meta, rgb)
-    return send_file(folder / f'{kind}.png', mimetype='image/png')
+    if request.args.get('confirmed') != 'yes':
+        raise ValueError('Confirm your staining protocol before stain separation.')
+    mode = request.args.get('mode', 'dab')
+    if mode not in {'he', 'dab'} or kind not in ({'hematoxylin', 'eosin'} if mode == 'he' else {'hematoxylin', 'dab'}):
+        raise ValueError('This stain preview is not available for the selected protocol.')
+    ensure_stains(folder, meta, rgb, mode)
+    return send_file(folder / f'{mode}_v11_{kind}.png', mimetype='image/png')
 
 
 @app.post('/api/analyze/<image_id>')
@@ -124,9 +141,9 @@ def analyze(image_id):
     qc, _ = quality(rgb, settings)
     result = {'quality': qc, 'measurement': None}
     if settings.get('measure'):
-        if not confirmed(settings):
-            raise ValueError('Measurements require confirmed DAB + hematoxylin brightfield staining.')
-        hed = ensure_stains(folder, meta, rgb)
+        mode = confirmed_mode(settings)
+        settings = {**settings, 'stain_mode': mode}
+        hed = ensure_stains(folder, meta, rgb, mode)
         measurement, _, _ = measure(rgb, hed, settings)
         result['measurement'] = measurement
     return jsonify(result)
@@ -146,9 +163,9 @@ def overlay(image_id):
         _, mask = quality(rgb, settings)
         colour = [255, 0, 170]
     elif kind == 'positive':
-        if not confirmed(settings):
-            raise ValueError('Confirm DAB + hematoxylin first.')
-        hed = ensure_stains(folder, meta, rgb)
+        mode = confirmed_mode(settings)
+        settings = {**settings, 'stain_mode': mode}
+        hed = ensure_stains(folder, meta, rgb, mode)
         _, _, mask = measure(rgb, hed, settings)
         colour = [255, 180, 0]
     else:
